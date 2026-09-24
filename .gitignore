@@ -1,0 +1,37 @@
+# Images / plots
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.svg
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Large raw datasets
+data/raw_backblaze_HGST12TB_WDC22TB_Q1_2026.csv# Images / plots
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.svg
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Large raw datasets
+data/raw_backblaze_HGST12TB_WDC22TB_Q1_2026.csv

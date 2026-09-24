@@ -1,0 +1,323 @@
+"""
+data_pipeline.py
+=================
+Turns Backblaze-style hard-drive records into the per-drive right-censored
+time-to-failure dataset (`FailureData`) that weibull_core.py /
+bayes_estimator.py consume.
+
+Three data sources are supported:
+
+  A. `load_real_backblaze_dataset()` -- THE ONE USED BY DEFAULT (run_02).
+     Consumes genuine, actually-downloaded Backblaze Q1 2026 Drive Stats
+     daily CSVs (real per-drive, per-day SMART logs, downloaded directly
+     from backblaze.com -- see data/raw_backblaze_HGST12TB_WDC22TB_Q1_2026.csv
+     and its accompanying provenance note). For each drive, we take its
+     LAST recorded row in the quarter and read off two genuine fields:
+     `failure` (1 on a drive's final day if it failed that day, 0
+     otherwise) and `smart_9_raw` (power-on hours -- the drive's true
+     cumulative service time since manufacture, NOT the number of days it
+     happened to be visible inside this one quarterly file). Using
+     power-on hours rather than (last_date - first_date) is what makes a
+     SINGLE quarter's file sufficient to recover each drive's true
+     age-at-event, without needing to download and stitch together every
+     quarterly file back to each drive's original deployment date.
+
+  B. `load_backblaze_raw_csvs()`  -- parses the REAL Backblaze Drive Stats
+     daily-CSV schema (date, serial_number, model, capacity_bytes, failure,
+     ~90 SMART columns) using (last_date - first_date) as the time-to-event
+     instead of power-on-hours. Kept as an alternative/reference parser --
+     correct when you have the FULL multi-quarter history of a cohort
+     since deployment, but on a single quarter's file it understates older
+     drives' true age, which is why (A) is what run_02 actually uses.
+
+  C. `build_real_stat_calibrated_dataset()` -- legacy fallback, no longer
+     used by default now that genuine raw data has been downloaded (see A).
+     Kept for reference / for environments where network access to
+     backblaze.com is unavailable: builds a per-drive dataset whose
+     population size, censoring horizon and EXPECTED failure count match
+     real, cited Backblaze aggregate statistics, but whose individual
+     failure DAYS are simulated from a Weibull model (see its own
+     docstring below for full details).
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+import glob
+import os
+import numpy as np
+import pandas as pd
+
+from .weibull_core import FailureData
+
+
+# --------------------------------------------------------------------------- #
+# A. Real Backblaze data, keyed off actual SMART power-on-hours (default)
+# --------------------------------------------------------------------------- #
+def load_real_backblaze_dataset(
+    csv_path: str,
+    full_model_name: str,
+    kappa: float,
+    date_col: str = "date",
+    serial_col: str = "serial_number",
+    model_col: str = "model",
+    failure_col: str = "failure",
+    power_on_hours_col: str = "smart_9_raw_power_on_hours",
+) -> tuple[FailureData, dict]:
+    """Build a genuine per-drive FailureData object from real, downloaded
+    Backblaze Drive Stats daily records for one drive model.
+
+    `csv_path` is expected to already be filtered to the model(s) of
+    interest (see data/raw_backblaze_HGST12TB_WDC22TB_Q1_2026.csv, built by
+    streaming every daily CSV in Backblaze's real data_Q1_2026.zip through
+    an awk filter on the `model` column -- the full daily files are ~130MB
+    x 90 days x the whole Backblaze fleet, so this pre-filter keeps only
+    the two models this project studies).
+
+    For each physical drive (`serial_number`), we take its LAST row in the
+    quarter (drives are removed from the daily snapshot the day after they
+    fail or leave the fleet, so the last row is exactly the failure/
+    censoring event) and read:
+      * `failure`      -- 1 if this drive failed on that day, else 0
+      * power-on hours -- the drive's real cumulative service life at that
+        point, converted to days (hours / 24). This is a genuine SMART
+        attribute reported by the drive's own firmware, not derived from
+        how long the drive happened to appear in this one quarterly file
+        -- so it correctly reflects each drive's true age even though we
+        only downloaded a single quarter of daily snapshots.
+
+    Returns (FailureData, info) where info records the provenance (file,
+    model, row/date range, drive and failure counts) for full transparency.
+    """
+    df = pd.read_csv(csv_path)
+    df = df[df[model_col] == full_model_name].copy()
+    if df.empty:
+        raise ValueError(f"No rows found for model={full_model_name!r} in {csv_path}")
+    df[date_col] = pd.to_datetime(df[date_col])
+
+    last_rows = df.sort_values(date_col).groupby(serial_col, as_index=False).last()
+
+    age_days = (last_rows[power_on_hours_col].to_numpy(dtype=float)) / 24.0
+    age_days = np.maximum(age_days, 1e-6)  # FailureData requires strictly positive times
+    is_failure = last_rows[failure_col].to_numpy() == 1
+
+    failure_times = age_days[is_failure]
+    censor_times = age_days[~is_failure]
+
+    data = FailureData(failure_times=failure_times, censor_times=censor_times, kappa=kappa)
+
+    info = {
+        "source": "real Backblaze Drive Stats, Q1 2026 (data_Q1_2026.zip, downloaded from backblaze.com)",
+        "source_csv": csv_path,
+        "model": full_model_name,
+        "date_range": [str(df[date_col].min().date()), str(df[date_col].max().date())],
+        "n_drives": int(len(last_rows)),
+        "n_failures": int(is_failure.sum()),
+        "n_censored": int((~is_failure).sum()),
+        "assumed_kappa": kappa,
+        "age_measure": "SMART attribute 9 (power-on hours) at each drive's last recorded day in the quarter, converted to days",
+    }
+    return data, info
+
+
+# --------------------------------------------------------------------------- #
+# A. Real Backblaze raw-CSV parser (schema-accurate; for the user's own
+#    locally-downloaded quarterly files)
+# --------------------------------------------------------------------------- #
+def load_backblaze_raw_csvs(
+    csv_dir: str,
+    model: str,
+    kappa: float,
+    date_col: str = "date",
+    serial_col: str = "serial_number",
+    model_col: str = "model",
+    failure_col: str = "failure",
+) -> FailureData:
+    """Parse real Backblaze daily-snapshot CSV(s) into a FailureData object
+    for one drive `model`.
+
+    Each daily file has one row per operational drive that day. A drive's
+    time-to-failure (in days) is (last observed date - first observed date);
+    failure=1 on its last row means it failed that day, otherwise it was
+    still healthy when removed from observation (censored).
+
+    Parameters
+    ----------
+    csv_dir : folder containing the real Backblaze CSV file(s) (or a glob
+              pattern ending in .csv); supports both the old one-file-per-day
+              layout and the newer packaged quarterly CSVs.
+    model   : exact Backblaze model string to filter on, e.g.
+              "HGST HUH721212ALE600" or "ST4000DM000".
+    kappa   : known Weibull shape to attach to the resulting FailureData.
+    """
+    paths = sorted(glob.glob(os.path.join(csv_dir, "**", "*.csv"), recursive=True))
+    if not paths:
+        raise FileNotFoundError(f"No CSV files found under {csv_dir}")
+
+    frames = []
+    for p in paths:
+        df = pd.read_csv(
+            p, usecols=[date_col, serial_col, model_col, failure_col], low_memory=False
+        )
+        df = df[df[model_col] == model]
+        if len(df):
+            frames.append(df)
+    if not frames:
+        raise ValueError(f"No rows found for model={model!r} in {csv_dir}")
+
+    all_rows = pd.concat(frames, ignore_index=True)
+    all_rows[date_col] = pd.to_datetime(all_rows[date_col])
+
+    failure_times, censor_times = [], []
+    for serial, grp in all_rows.groupby(serial_col):
+        grp = grp.sort_values(date_col)
+        first_day = grp[date_col].iloc[0]
+        last_day = grp[date_col].iloc[-1]
+        service_days = max((last_day - first_day).days, 1)
+        if int(grp[failure_col].iloc[-1]) == 1:
+            failure_times.append(service_days)
+        else:
+            censor_times.append(service_days)
+
+    return FailureData(
+        failure_times=np.array(failure_times, dtype=float),
+        censor_times=np.array(censor_times, dtype=float),
+        kappa=kappa,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# B. Real, cited aggregate statistics (Backblaze Q1 2026 Drive Stats report)
+# --------------------------------------------------------------------------- #
+@dataclass
+class RealModelStats:
+    """Real, published, cited population-level statistics for one drive
+    model, used to CALIBRATE a synthetic per-drive dataset (see module
+    docstring, source B)."""
+
+    label: str
+    short_label: str
+    manufacturer: str
+    model: str
+    capacity_tb: float
+    drive_count: int          # real N
+    avg_age_months: float     # real average fleet age
+    drive_days: int           # real cumulative observed drive-days
+    drive_failures: int       # real cumulative observed failures
+    afr_reported_pct: float   # real reported annualised failure rate (%)
+    source_url: str
+    source_note: str
+
+
+# Figures below are taken verbatim from Backblaze's own Q1 2026 Drive Stats
+# report and press materials (published July 2026), retrieved 2026-09-23:
+#   https://www.backblaze.com/blog/backblaze-drive-stats-for-q1-2026/
+#   https://www.backblaze.com/blog/?p=113117   (cumulative / lifetime table)
+#   https://www.backblaze.com/hard-drive.html  (fleet-level Q1 2026 snapshot)
+REAL_MODEL_STATS = {
+    "HGST_12TB": RealModelStats(
+        label="HGST HUH721212ALE600 (12 TB) -- large, long-tenured cohort",
+        short_label="HGST HUH721212ALE600 (12TB)",
+        manufacturer="HGST",
+        model="HUH721212ALE600",
+        capacity_tb=12,
+        drive_count=2608,
+        avg_age_months=74.5,
+        drive_days=6_115_413,
+        drive_failures=104,
+        afr_reported_pct=0.62,
+        source_url="https://www.backblaze.com/blog/?p=113117",
+        source_note=(
+            "Cumulative/lifetime Drive Stats table row for this model, as "
+            "published by Backblaze."
+        ),
+    ),
+    "WDC_22TB": RealModelStats(
+        label="WDC WUH722222ALE6L4 (22 TB) -- Backblaze's largest single-model "
+        "cohort, young fleet",
+        short_label="WDC WUH722222ALE6L4 (22TB)",
+        manufacturer="WDC",
+        model="WUH722222ALE6L4",
+        capacity_tb=22,
+        drive_count=45638,
+        avg_age_months=16.1,
+        drive_days=3_992_942,
+        drive_failures=42,
+        afr_reported_pct=0.38,
+        source_url="https://www.backblaze.com/blog/backblaze-drive-stats-for-q1-2026/",
+        source_note=(
+            "Q1 2026 Drive Stats quarterly table row for this model, as "
+            "published by Backblaze (10,220 drives deployed that quarter; "
+            "this is Backblaze's largest single drive-model population, "
+            "over 45,000 units)."
+        ),
+    ),
+}
+
+
+# --------------------------------------------------------------------------- #
+# Calibration: turn a RealModelStats summary into a synthetic per-drive
+# FailureData object consistent with a Weibull(kappa, beta) survival model.
+# --------------------------------------------------------------------------- #
+def calibrate_beta_from_aggregate(stats: RealModelStats, kappa: float) -> tuple[float, float]:
+    """Solve for the Weibull rate beta such that, under a common censoring
+    horizon C = drive_days / drive_count (the empirical average observed
+    service time per drive), the model-implied failure probability
+    1 - exp(-beta*C^kappa/kappa) matches the real observed failure
+    proportion (drive_failures / drive_count).
+
+    Returns (beta, C).
+    """
+    C = stats.drive_days / stats.drive_count
+    p_fail = stats.drive_failures / stats.drive_count
+    p_fail = min(max(p_fail, 1e-6), 1 - 1e-9)  # numerical safety
+    beta = -kappa * np.log(1.0 - p_fail) / (C**kappa)
+    return beta, C
+
+
+def build_real_stat_calibrated_dataset(
+    stats_key: str, kappa: float, rng: np.random.Generator
+) -> tuple[FailureData, dict]:
+    """Build a synthetic per-drive FailureData object for the named real
+    model, calibrated so that:
+        * the number of units            == the REAL published drive_count
+        * the censoring horizon          == the REAL published avg drive-days/drive
+        * the EXPECTED failure count      == the REAL published drive_failures
+          (the realised count in any one simulation will be close to, but
+          not bit-for-bit identical to, the real number -- exactly as one
+          random draw from a Binomial(N, p) need not equal N*p exactly)
+    under an assumed-known Weibull shape `kappa` (see README for the
+    literature-informed choice of kappa used in this project).
+
+    Returns (FailureData, calibration_info) where calibration_info records
+    every real number used and the implied beta/eta, for full transparency
+    in the generated report.
+    """
+    stats = REAL_MODEL_STATS[stats_key]
+    beta, C = calibrate_beta_from_aggregate(stats, kappa)
+
+    N = stats.drive_count
+    lifetimes = (-kappa * np.log(rng.random(N)) / beta) ** (1.0 / kappa)
+    failed_mask = lifetimes <= C
+
+    failure_times = lifetimes[failed_mask]
+    censor_times = np.full(np.sum(~failed_mask), C)
+
+    data = FailureData(failure_times=failure_times, censor_times=censor_times, kappa=kappa)
+
+    info = {
+        "stats_key": stats_key,
+        "label": stats.label,
+        "source_url": stats.source_url,
+        "source_note": stats.source_note,
+        "real_drive_count": stats.drive_count,
+        "real_drive_days": stats.drive_days,
+        "real_drive_failures": stats.drive_failures,
+        "real_afr_reported_pct": stats.afr_reported_pct,
+        "assumed_kappa": kappa,
+        "censoring_horizon_days_C": C,
+        "calibrated_beta": beta,
+        "implied_eta_scale_days": (kappa / beta) ** (1.0 / kappa),
+        "realised_failure_count": int(failed_mask.sum()),
+        "realised_failure_rate_pct": 100.0 * failed_mask.mean(),
+    }
+    return data, info
